@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+greenhouse_save*.json*
+*_save.json*
+*.tmp
+*.bak
+__pycache__/
+*.pyc
+.venv/
+.env
+greenhouse_save.json
+*.old-*.json

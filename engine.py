@@ -67,6 +67,12 @@ def _save_path():
     return os.path.join(base, "greenhouse_save.json")
 
 
+def posint(x):
+    """严格的正整数：'3' → 3；'0'、'-1'、'1.5'、'abc'、'nan' → None。"""
+    x = str(x).strip()
+    return int(x) if x.isdigit() and int(x) > 0 else None
+
+
 def year_day(day):
     return (day - 1) % YEAR_LEN + 1
 
@@ -101,7 +107,7 @@ def _fresh_state(seed):
         "next": {"P": 1, "S": 1, "X": 1, "Q": 1, "F": 1},
         "catalog": {"genera": [], "lines": [], "traits": {}, "anomalies": {}},
         "collection": [], "herbarium": [], "docs": [], "facts": [], "flags": [], "npc": {},
-        "edone": [], "pending": None, "notes": [], "log": [], "ups": [], "reports": [],
+        "edone": [], "pending": None, "notes": [], "projects": {}, "cur_project": None, "log": [], "ups": [], "reports": [],
         "news": [], "searched": {}, "stats": {"sown": 0, "germ": 0, "crosses": 0, "harvests": 0, "died": 0,
                                                "observed": 0, "tests": 0, "reports": 0},
         "nb_tonight": {}, "kcap": ZONES["K"]["cap"],
@@ -425,6 +431,9 @@ class Game:
         p["alive"] = False
         p["stage"] = "dead"
         p["death"] = [self.s["day"], cause]
+        fr = p.get("fruit")
+        if fr and fr.get("xid") in self.s["crosses"] and not self.s["crosses"][fr["xid"]].get("lot"):
+            self.s["crosses"][fr["xid"]]["status"] = "失败：母本死了，果实没能成熟"
         p["fruit"] = None
         p["flower"] = None
         self.hist(p, f"死亡：{cause}")
@@ -1069,7 +1078,11 @@ def _sc_lin_leave(g):
     return g.s.get("visit_day") is not None and g.s["day"] >= g.s["visit_day"] + 2
 
 
-SPECIAL_COND = {"lin_reply_due": _sc_lin_reply, "lin_visit_due": _sc_lin_visit, "lin_leave_due": _sc_lin_leave,
+def _sc_eval_upcoming(g):
+    return year_day(g.s["day"]) <= 42 and not g.flag("eval_done")
+
+
+SPECIAL_COND = {"eval_upcoming": _sc_eval_upcoming, "lin_reply_due": _sc_lin_reply, "lin_visit_due": _sc_lin_visit, "lin_leave_due": _sc_lin_leave,
                 "nursery_two_lots": _sc_nursery_two, "collection_any": _sc_collection_any, "aeris_any": _sc_aeris_any}
 
 
@@ -1174,6 +1187,7 @@ def _sp_evaluation(g, arg):
     hp = sum(p["health"] for p in alive) / len(alive) if alive else 0
     score = reps * 2 + expl * 2 + traits // 10 + (2 if hp >= 60 else 0) + (1 if s["funds"] >= 0 else -2)
     g.setflag("eval_done")
+    g.setflag("eval_known")
     if score >= 12:
         res, bonus = "优秀", 600
         g.run_eff(["rep:+8", "trust:wen:+1"])
@@ -1200,6 +1214,11 @@ def _sp_evaluation(g, arg):
           + (f"下次拨款加 {bonus} 元。" if bonus else ""))
 
 
+def _sp_luo_win(g, arg):
+    g.run_eff(["flag:luo_bluecold", "flag:luo_asked_help", "unflag:luo_paused",
+               "log:骆青禾在冷室里放了一盆新的朱点花，花是灰蓝色的。标签上写着「冷蓝 · 亲本之一由同事提供」。"])
+
+
 def _sp_heater(g, arg):
     s = g.s
     if arg == "rescue":
@@ -1209,11 +1228,31 @@ def _sp_heater(g, arg):
                 for z in ("N", "K"):
                     if g.zone_count(z) < g.zcap(z):
                         p["zone"] = z
+                        p["guest"] = "B"
                         g.hist(p, f"锅炉坏了，临时搬到{ZONES[z]['name']}")
                         moved += 1
                         break
-        g.say(f"你和小满搬了一上午，挪走了 {moved} 盆怕冷的。")
+        g.say(f"你和小满搬了一上午，挪走了 {moved} 盆怕冷的。锅炉修好以后会搬回去。")
         g.setflag("heater_broken")
+        s.setdefault("timers", []).append([s["day"] + 2, "special:heater:return"])
+    elif arg == "return":
+        back = 0
+        for p in s["plants"].values():
+            if p.get("guest") and p["alive"]:
+                home = p.pop("guest")
+                if p["id"] not in s["collection"] and p["zone"] in ("N", "K") and g.zone_count(home) < g.zcap(home):
+                    p["zone"] = home
+                    g.hist(p, f"锅炉修好了，搬回{ZONES[home]['name']}")
+                    back += 1
+                elif p["zone"] == "K" and p["id"] not in s["collection"]:
+                    p["zone"] = "A"
+                    g.hist(p, "锅炉修好了，热带温室没位置，搬去主温室")
+                    back += 1
+            else:
+                p.pop("guest", None)
+        if back:
+            g.log(f"🔧 锅炉修好了，临时搬走的 {back} 盆搬了回去。")
+        return
     elif arg == "heaters":
         g.say("电暖器嗡嗡地响了一夜，热带温室守住了十八度。主温室还是冷。")
         g.setflag("heater_broken")
@@ -1260,10 +1299,15 @@ def _sp_old_lot(g, arg):
 def _sp_year_review(g, arg):
     s = g.s
     yr = (s["day"] - 1) // YEAR_LEN + 1
-    st = s["stats"]
-    g.log(f"📔 第 {yr} 年结束了。这一年：播种 {st['sown']} 粒，出苗 {st['germ']} 株，授粉 {st['crosses']} 次，采种 {st['harvests']} 次，"
+    prev = s.get("stats_prev", {})
+    span = "这一年" if ("stats_prev" in s or yr == 1) else "到今年为止（旧存档，没有逐年记录）"
+    st = {k: v - prev.get(k, 0) for k, v in s["stats"].items()}
+    s["stats_prev"] = dict(s["stats"])
+    if "eval_done" in s["flags"]:
+        s["flags"].remove("eval_done")
+    g.log(f"📔 第 {yr} 年结束了。{span}：播种 {st['sown']} 粒，出苗 {st['germ']} 株，授粉 {st['crosses']} 次，采种 {st['harvests']} 次，"
           f"死亡 {st['died']} 株，观察记录 {st['observed']} 次，写了 {st['reports']} 篇报告。图鉴里有 {len(s['catalog']['traits'])} 种性状表现，"
-          f"收藏温室里 {len(s['collection'])} 株，标本 {len(s['herbarium'])} 份。")
+          f"收藏温室里 {len(s['collection'])} 株，标本 {len(s['herbarium'])} 份（这两项是现在的数）。")
     g.log("研究所的日子还在继续。明天是新一年的春天。")
 
 
@@ -1274,7 +1318,7 @@ def _sp_mark_day(g, arg):
 SPECIALS = {
     "mark_day": _sp_mark_day, "mixup": _sp_mixup, "audit": _sp_audit, "cert": _sp_cert, "spend": _sp_spend, "seedbank_hit": _sp_seedbank_hit,
     "corridor": _sp_corridor, "radio_to": _sp_radio_to, "openday_collection": _sp_openday_collection,
-    "openday_sell": _sp_openday_sell, "evaluation": _sp_evaluation, "heater": _sp_heater, "mo_borrow": _sp_mo_borrow,
+    "openday_sell": _sp_openday_sell, "evaluation": _sp_evaluation, "luo_win": _sp_luo_win, "heater": _sp_heater, "mo_borrow": _sp_mo_borrow,
     "mo_return": _sp_mo_return, "old_lot": _sp_old_lot, "year_review": _sp_year_review,
 }
 
@@ -1367,7 +1411,11 @@ HELP = """【不太正常的植物研究所】你是新来的植物研究员。�
  人    talk <人>｜ask <人> <话题>｜give <株> <人>｜write lin
  经营  shop｜buy <物资> [数量]｜upgrade <设备>｜report <实验>｜report anomaly <异常>
  探索  open D｜search <区>
+ 待办  tasks 今天要做的事｜forecast [天数] 未来几天会到期的事｜log brief｜exp brief 实验索引
+       compare <实验> <实验> [性状] 并排比较｜project new/add/status/note/list 把多代实验归成一个研究项目
  时间  end [天数]（结束今天；多天最多 7 天，期间没人照料）｜choose <编号>
+小贴士：observe S037 / observe X029 只看某个批次或实验的后代（加 new 只看没看过的）；observe A flowering 只看开花的；water all 一次浇完所有温室；
+       treat 和 buy 都可以写中文（treat A 肥皂水，buy 培养土 10）；note / diary / mark 后面的分号会当成正文。
 种子库里的批次就是你的材料；表型要靠 observe 一株一株记下来，图鉴和统计只用你记下来的数据。"""
 
 
@@ -1476,8 +1524,25 @@ def _plant_table(g, plants):
               + (f"｜{'，'.join(extra)}" if extra else "") + f"｜{_short(p, g)}")
 
 
+STAGE_ALIAS = {"seedling": "seedling", "幼苗": "seedling", "juvenile": "juvenile", "营养生长": "juvenile", "mature": "mature",
+               "成株": "mature", "flowering": "flowering", "开花": "flowering", "fruiting": "fruiting", "结果": "fruiting",
+               "seed": "seed", "种子": "seed"}
+
+
 def c_plants(g, a):
     s = g.s
+    if a and a[-1].lower() in STAGE_ALIAS and (len(a) == 1 or find_zone(a[0])):
+        stg = STAGE_ALIAS[a[-1].lower()]
+        z = find_zone(a[0]) if len(a) > 1 else None
+        ps = [p for p in s["plants"].values() if p["alive"] and p["stage"] == stg and (z is None or p["zone"] == z)]
+        g.say(f"{(ZONES[z]['name'] if z else '所有温室')}里{STAGE_CN[stg]}的植株：{len(ps)} 株")
+        by = {}
+        for p in ps[:60]:
+            by.setdefault(p["zone"], []).append(p)
+        for zz, lst in by.items():
+            g.say(f"【{ZONES[zz]['name']}】")
+            _plant_table(g, lst)
+        return
     arg = a[0] if a else ""
     z = find_zone(arg) if arg else None
     if z:
@@ -1650,6 +1715,27 @@ def _counter(it):
 
 def c_exp(g, a):
     s = g.s
+    if a and a[0] in ("brief", "简"):
+        if not s["crosses"]:
+            g.say("还没有做过授粉实验。")
+            return
+        g.say("🧫 实验索引（编号｜亲本｜进度｜后代：活/播下｜观察过的）：")
+        allx = len(a) > 1 and a[1] in ("all", "全部")
+        hidden = 0
+        for x in s["crosses"].values():
+            if not allx and x["father"] == "open" and "失败" in x["status"]:
+                hidden += 1
+                continue
+            kids = [p for p in s["plants"].values() if p.get("xid") == x["id"]]
+            alive = sum(1 for p in kids if p["alive"])
+            obs = sum(1 for p in kids if p["obs"])
+            f = "自交" if x["kind"] == "self" else "开放授粉" if x["father"] == "open" else x["father"]
+            prog = "已采种" if x["lot"] else ("失败" if "失败" in x["status"] else "进行中")
+            projs = [n for n, pj in s.get("projects", {}).items() if x["id"] in pj["items"]]
+            g.say(f"  {x['id']}｜{x['mother']}×{f}｜{prog}" + (f"｜{alive}/{len(kids)}｜{obs}" if kids else "")
+                  + (f"｜{'、'.join(projs)}" if projs else ""))
+        g.say("（exp <编号> 看详情" + (f"；另有 {hidden} 个失败的开放授粉没列出，exp brief all 全看" if hidden else "") + "）")
+        return
     if not a:
         if not s["crosses"]:
             g.say("还没有做过授粉实验。")
@@ -1835,21 +1921,45 @@ def c_read(g, a):
         g.say("（这页纸的最后一句，你看了两遍。）")
 
 
+BRIEF_SKIP = ("🌸", "🌱", "🔔")
+
+
 def c_log(g, a):
-    try:
-        d = int(a[0]) if a else g.s["day"]
-    except ValueError:
-        d = g.s["day"]
-    lines = [t for k, t in g.s["log"] if k == d or (not a and k == d - 1)]
-    g.say(f"🗒️ 第 {d} 天的记录：" if lines else "那天没有记录。")
-    for t in lines[:60]:
-        g.say("  " + t)
+    brief = bool(a) and a[0] in ("brief", "简")
+    if brief:
+        a = a[1:]
+    if a:
+        d = posint(a[0])
+        if d is None or d > g.s["day"]:
+            g.say(f"写第几天，1~{g.s['day']}。比如 log 12、log brief 12。")
+            return
+        days = [d]
+    else:
+        days = [d for d in (g.s["day"] - 1, g.s["day"]) if d >= 1]  # 不写日期：昨天和今天，分开列
+    shown = 0
+    skipped = 0
+    for d in days:
+        lines = [t for k, t in g.s["log"] if k == d]
+        if brief:
+            n0 = len(lines)
+            lines = [t for t in lines if not t.startswith(BRIEF_SKIP)]
+            skipped += n0 - len(lines)
+        if not lines:
+            continue
+        g.say(f"🗒️ 第 {d} 天的记录：")
+        for t in lines[:60]:
+            g.say("  " + t)
+        shown += 1
+    if not shown:
+        g.say("那天没有记录。" if len(days) == 1 else "昨天和今天都没有记录。")
+    if skipped:
+        g.say(f"（省略了 {skipped} 条开花、发芽之类的日常消息；不加 brief 看全部）")
 
 
 def c_note(g, a):
     if not a:
         return c_notes(g, a)
-    g.s["notes"].append([g.s["day"], " ".join(a)[:400]])
+    g.s["notes"].append([g.s["day"], " ".join(a)[:2000]])
     g.say("记在实验记录本上了。")
 
 
@@ -1868,7 +1978,7 @@ def c_mark(g, a):
     if not p:
         g.say(err)
         return
-    p["marks"].append([g.s["day"], " ".join(a[1:])[:200]])
+    p["marks"].append([g.s["day"], " ".join(a[1:])[:1000]])
     g.say(f"⚑ 已在 {p['id']} 的档案上做了标记。")
 
 
@@ -1881,11 +1991,29 @@ def _cost(g, m):
 
 def c_observe(g, a):
     if not a:
-        g.say("观察哪一株？observe <株> 或 observe <区>（区里每株都看一遍）")
+        g.say("观察哪些？observe <株> | <区> | <批次 S037> | <实验 X029> | <区> <阶段>（比如 observe A flowering）")
         return
-    z = find_zone(a[0])
-    if z:
-        ps = [p for p in g.zone_plants(z) if p["stage"] not in ("seed",)]
+    q = a[0].upper()
+    group = None
+    if q in g.s["lots"] or q in g.s["crosses"] or "+" in q:
+        kids, _ = _offspring(g, q)
+        if kids is None:
+            g.say("没有这个批次或实验。")
+            return
+        ps = [p for p in kids if p["alive"] and p["stage"] not in ("seed", "gone", "lent")]
+        if len(a) > 1 and a[1].lower() in ("new", "未看", "没看"):
+            ps = [p for p in ps if not any(t in p["obs"] for t in ("flower", "leaf", "height"))]
+        group = (f"{q} 的后代" + ("里还没看过的" if len(a) > 1 else ""), ps)
+    elif find_zone(a[0]) and len(a) > 1:
+        stg = STAGE_ALIAS.get(a[1].lower())
+        if not stg:
+            g.say("阶段可以写：seedling 幼苗、juvenile 营养生长、mature 成株、flowering 开花、fruiting 结果")
+            return
+        z = find_zone(a[0])
+        group = (f"{ZONES[z]['name']}里{STAGE_CN[stg]}的", [p for p in g.zone_plants(z) if p["stage"] == stg])
+    z = None if group else find_zone(a[0])
+    if group or z:
+        title, ps = group if group else (ZONES[z]["name"], [p for p in g.zone_plants(z) if p["stage"] not in ("seed",)])
         if not ps:
             g.say("那里没有可以观察的植株。")
             return
@@ -1895,7 +2023,7 @@ def c_observe(g, a):
             return
         can = min(len(ps), g.left() // 5)
         ps = ps[:can]
-        g.say(f"🔍 你在{ZONES[z]['name']}里一株一株看过去（{len(ps)} 株，{5 * len(ps)} 分钟）：")
+        g.say(f"🔍 你把{title}一株一株看过去（{len(ps)} 株，{5 * len(ps)} 分钟）：")
         before = len(g.s["catalog"]["traits"])
         for p in ps:
             v = g.observe(p, quiet=True)
@@ -1904,6 +2032,11 @@ def c_observe(g, a):
         newn = len(g.s["catalog"]["traits"]) - before
         if newn:
             g.say(f"  📗 图鉴新增 {newn} 种性状表现。")
+        if group and (q in g.s["crosses"] or q in g.s["lots"] or "+" in q):
+            kids_all, _ = _offspring(g, q)
+            ready = [TRAIT_CN[t] for t in ("flower", "leaf") if sum(1 for p in kids_all if t in p["obs"]) >= 10]
+            if ready:
+                g.say(f"  📈 {q} 的后代已经有十几株的{('和'.join(ready))}记录了，可以 ratio {q} {ready[0]} 看看分离比。")
         if can < m // 5:
             g.say(f"（时间不够，还有 {m // 5 - can} 株没看。）")
         return
@@ -1968,10 +2101,9 @@ def c_sow(g, a):
     if not lot:
         g.say("没有这个批次。（lots）")
         return
-    try:
-        n = int(a[1])
-    except ValueError:
-        g.say("粒数要写数字。")
+    n = posint(a[1])
+    if n is None:
+        g.say("粒数要写正整数，比如 sow S001 10。")
         return
     z = _sow_zone(g, a)
     if not z or s["zones"][z]["locked"] or z == "K":
@@ -2016,6 +2148,8 @@ def c_sow(g, a):
 
 
 def _targets(g, arg):
+    if arg.lower() in ("all", "全部"):
+        return [p for z in ZONES if z != "K" for p in g.zone_plants(z) if p["stage"] != "seed"], "all"
     z = find_zone(arg)
     if z:
         return [p for p in g.zone_plants(z) if p["stage"] != "seed" or True], True
@@ -2033,7 +2167,8 @@ def c_water(g, a):
     ps, zone = _targets(g, a[0])
     if ps is None:
         return
-    m = 20 if zone else 3
+    nz = len({p["zone"] for p in ps})
+    m = 20 * nz if zone == "all" else 20 if zone else 3
     if not _cost(g, m):
         return
     for p in ps:
@@ -2053,7 +2188,7 @@ def c_feed(g, a):
     if g.s["supplies"]["nutrient"] < need:
         g.say("营养液不够了。（buy nutrient）")
         return
-    m = 25 if zone else 5
+    m = 25 * len({p["zone"] for p in ps}) if zone == "all" else 25 if zone else 5
     if not _cost(g, m):
         return
     g.s["supplies"]["nutrient"] -= need
@@ -2106,6 +2241,11 @@ def c_repot(g, a):
     g.spend(15)
 
 
+TREAT_ALIAS = {"肥皂水": "soap", "肥皂": "soap", "瓢虫": "bio", "生物防治": "bio", "杀菌剂": "fungicide", "杀虫剂": "pesticide"}
+SUPPLY_ALIAS = {v[0]: k for k, v in SUPPLIES.items()}
+SUPPLY_ALIAS.update({"瓢虫": "bio", "隔离袋": "bags", "标记试剂": "marker", "试剂": "marker", "培养基": "agar", "花盆": "pot_s"})
+
+
 def c_treat(g, a):
     if len(a) < 2:
         g.say("用法：treat <株|区> <方法>，方法：soap 肥皂水、bio 瓢虫、fungicide 杀菌剂、pesticide 杀虫剂")
@@ -2113,9 +2253,9 @@ def c_treat(g, a):
     ps, zone = _targets(g, a[0])
     if ps is None:
         return
-    meth = a[1]
+    meth = TREAT_ALIAS.get(a[1], a[1])
     if meth not in ("soap", "bio", "fungicide", "pesticide"):
-        g.say("方法：soap、bio、fungicide、pesticide")
+        g.say("方法：肥皂水(soap)、瓢虫(bio)、杀菌剂(fungicide)、杀虫剂(pesticide)")
         return
     if g.s["supplies"][meth] < 1:
         g.say(f"{SUPPLIES[meth][0]}用完了。")
@@ -2162,6 +2302,7 @@ def c_move(g, a):
     if p["id"] in g.s["collection"]:
         g.s["collection"].remove(p["id"])
     p["zone"] = z
+    p.pop("guest", None)
     g.hist(p, f"搬到{ZONES[z]['name']}")
     g.say(f"{p['id']} 搬到了{ZONES[z]['name']}。")
     g.spend(5)
@@ -2718,14 +2859,15 @@ def c_shop(g, a):
 
 
 def c_buy(g, a):
+    if a:
+        a = [SUPPLY_ALIAS.get(a[0], a[0])] + a[1:]
     if not a or a[0] not in SUPPLIES:
-        g.say("买什么？shop 看列表。")
+        g.say("买什么？shop 看列表（中文名也可以，比如 buy 培养土 10）。")
         return
-    try:
-        n = int(a[1]) if len(a) > 1 else 1
-    except ValueError:
-        n = 1
-    n = max(1, min(n, 200))
+    n = posint(a[1]) if len(a) > 1 else 1
+    if n is None or n > 200:
+        g.say("数量要写 1~200 的整数，比如 buy soil 10。什么都没买。")
+        return
     cost = SUPPLIES[a[0]][1] * n
     if g.s["funds"] < cost:
         g.say(f"要 {cost} 元，经费不够。")
@@ -2856,18 +2998,37 @@ def c_give(g, a):
     if not _cost(g, 10):
         return
     gen = p["genome"]
-    if nid == "luo" and g.flag("luo_asks") and not g.flag("luo_helped"):
+    if nid == "luo" and (g.flag("luo_asks") or g.flag("luo_need")) and not g.flag("luo_helped"):
         fl = p["obs"].get("flower", [""])[0]
         cold = p["obs"].get("cold", [""])[0]
         if "Ruberia" in gen["genus"] and fl.startswith(("lilac", "pink")) and cold in ("cold_ok", "cold_mild"):
             g.run_eff(["flag:luo_helped", "trust:luo:+2", "mem:luo:help:你给了我一株冷室里也能开的浅色朱点花", "rep:+3",
-                       f"say:骆青禾拿着 {p['id']} 看了很久，翻了翻你的观察记录。「低温下记录过开花……好。」她把它抱走了，「我会在记录里写上你的编号。」"])
+                       f"say:骆青禾拿着 {p['id']} 看了很久，翻了翻你的观察记录。「低温下记录过开花……好。」她把它抱走了，「我会在记录里写上你的编号。」"
+                       + ("「暂停的那个项目，我再试一次。」" if g.flag("luo_paused") else "")])
+            g.s.setdefault("timers", []).append([g.s["day"] + 20, "special:luo_win"])
             p["alive"] = False
             p["stage"] = "gone"
             p["death"] = [g.s["day"], "送给了骆青禾，作为冷蓝项目的亲本"]
             g.hist(p, "送给骆青禾当冷蓝项目的亲本")
             g.spend(10)
             return
+        if "Ruberia" in gen["genus"] or g.flag("luo_need") or g.flag("luo_asks"):
+            miss = []
+            if "Ruberia" not in gen["genus"]:
+                miss.append("这不是朱点花")
+            if not fl:
+                miss.append("你没有它的花色记录（开花时 observe 一次）")
+            elif not fl.startswith(("lilac", "pink")):
+                miss.append(f"花色记录是「{p['obs']['flower'][1].split('，')[0]}」，我要淡紫或浅粉这样的浅色")
+            if not cold:
+                miss.append("没有低温下的观察记录（放在冷室或 10℃ 以下时 observe）")
+            elif cold not in ("cold_ok", "cold_mild"):
+                miss.append("低温记录显示它冻伤得厉害，在冷室里撑不住")
+            if miss:
+                g.say("骆青禾看了看你的记录，摇头：「" + "；".join(miss) + "。」"
+                      + ("她停了一下，「颜色偏不偏蓝我不在乎，那是我的事。我要的是底色和耐冷。」" if fl and not fl.startswith(("lilac", "pink")) and "紫" in p["obs"]["flower"][1] else ""))
+                g.spend(10)
+                return
         g.say("骆青禾看了看：「我要的是淡紫或者浅色的朱点花，而且得有在 10℃ 以下的观察记录，证明它在冷的地方还挺得住。」")
         g.spend(10)
         return
@@ -2992,6 +3153,240 @@ def c_report(g, a):
     g.spend(90)
 
 
+def _tasks(g, horizon=0):
+    """（时间, 文字）列表：今天就要做的，和 horizon 天内会到期的。"""
+    s = g.s
+    day = s["day"]
+    out = []
+    for p in s["plants"].values():
+        if not p["alive"] or p["stage"] in ("gone", "lent"):
+            continue
+        fr = p["fruit"]
+        if fr and fr["ok"] and day >= fr["set"] + 3:
+            if day >= fr["ready"]:
+                out.append((0, f"🫛 采种：{p['id']}（{fr['xid']}）已经熟了，最晚第 {fr['ready'] + 6} 天要采，不然会裂开（harvest {p['id']}）"))
+            elif fr["ready"] - day <= horizon:
+                out.append((fr["ready"] - day, f"🫛 第 {fr['ready']} 天：{p['id']}（{fr['xid']}）的果荚成熟，之后 6 天内要采"))
+        elif fr and day < fr["set"] + 3 and fr["set"] + 3 - day <= horizon:
+            out.append((fr["set"] + 3 - day, f"🐝 第 {fr['set'] + 3} 天：{fr['xid']} 能看出有没有坐果"))
+        if p["zone"] == "K":
+            continue
+        if p["stage"] not in ("seed",) and p["water"] < 30:
+            out.append((0, ("water", p["zone"], p["id"]), f"💧 缺水：{p['id']}（盆土 {p['water']:.0f}）"))
+        if p["pests"]:
+            pn = "、".join(sorted(PESTS[k]["name"] for k in p["pests"]))
+            out.append((0, ("pest:" + pn, p["zone"], p["id"]), f"🐛 病虫害：{p['id']}——{pn}"))
+        if p["zone"] == "N" and p["stage"] in ("juvenile", "mature") and p["age"] >= 12:
+            out.append((0, ("nursery", p["zone"], p["id"]), f"🪴 该移出育苗室：{p['id']}（再挤着会长不好）"))
+        if p.get("rootbound"):
+            out.append((0, ("repot", p["zone"], p["id"]), f"🪴 根顶盆了：{p['id']}（repot）"))
+        if p["stage"] == "flowering" and p["flower"] and p["flower"]["open"] and not p["fruit"] and not p["bag"]:
+            left = p["flower"]["end"] - day
+            out.append((0, ("open", p["zone"], p["id"]), f"🌸 开着花、没授粉也没套袋：{p['id']}（花期还剩约 {max(0, left)} 天，结束时可能被自然授粉）"))
+        g_ = g.genus(p)
+        if g_["annual"] and p["stage"] not in ("seed", "seedling") and 0 <= g_["life"] - p["age"] <= max(horizon, 5):
+            out.append((max(0, g_["life"] - p["age"]), f"🍂 {p['id']} 是一年生的，大约 {g_['life'] - p['age']} 天后到寿命"))
+    for q in s["pollen"].values():
+        life = 30 if g.up("freezer") else 5
+        rest = life - q["age"]
+        if 0 <= rest <= max(horizon, 1):
+            out.append((rest, f"🌼 花粉 {q['id']}（来自 {q['src']}）还能用 {rest} 天"))
+    for f in s["flasks"].values():
+        if f["state"] == "ready":
+            out.append((0, f"🧪 组培瓶 {f['id']} 可以移栽了（transplant {f['id']}）"))
+        elif f["state"] == "contaminated":
+            out.append((0, f"🧪 组培瓶 {f['id']} 污染了，要清理（transplant {f['id']}）"))
+        elif f["state"] == "growing" and f["ready"] - day <= horizon:
+            out.append((f["ready"] - day, f"🧪 第 {f['ready']} 天：组培瓶 {f['id']} 出结果"))
+    for sid, sg in s.get("signals", {}).items():
+        pass
+    nxt = ((day - 1) // GRANT_EVERY + 1) * GRANT_EVERY + 1
+    if nxt - day <= horizon:
+        out.append((nxt - day, f"💰 第 {nxt} 天：两周一次的拨款"))
+    if g.flag("eval_known") and not g.flag("eval_done") and 0 <= 42 - year_day(day) <= horizon:
+        out.append((42 - year_day(day), "📋 第 42 天：年度评估"))
+    out = [x if len(x) == 3 else (x[0], None, x[1]) for x in out]
+    out.sort(key=lambda x: x[0])
+    return [(d, line) for d, _, line in out] if horizon else out
+
+
+GROUP_HINT = {"nursery": ("🪴 该移出育苗室（再挤着会长不好）", "move <株> <区>"), "repot": ("🪴 根顶盆了", "repot <株> M"),"water": ("💧 缺水", "water {z}"), "open": ("🌸 开着花、没授粉也没套袋（花期结束时可能被自然授粉）", "bag <株>")}
+
+
+def c_tasks(g, a):
+    t = [x for x in _tasks(g, 0) if x[0] == 0]
+    if not t:
+        g.say("✅ 今天没有急事。")
+        return
+    single, groups = [], {}
+    for _, key, line in t:
+        if key:
+            groups.setdefault(key[0], []).append((key[1], key[2], line))
+        else:
+            single.append(line)
+    lines = list(single)
+    for cat, items in groups.items():
+        if len(items) <= 2:
+            lines += [x[2] for x in items]
+            continue
+        if cat.startswith("pest:"):
+            name = cat[5:]
+            ks = [k for k in PESTS if PESTS[k]["name"] in name.split("、")]
+            cn = {"soap": "肥皂水", "bio": "瓢虫", "fungicide": "杀菌剂", "pesticide": "杀虫剂"}
+            common = [m for m in PESTS[ks[0]]["treat"] if all(m in PESTS[k]["treat"] for k in ks)] if ks else []
+            if common or not ks:
+                meth = cn[common[0]] if common else "肥皂水"
+            else:
+                meth = cn[PESTS[ks[0]]["treat"][0]] + "；" + "；".join(f"treat {{z}} {cn[PESTS[k]['treat'][0]]}" for k in ks[1:])
+            title, hint = f"🐛 {name}", "treat {z} " + meth
+        else:
+            title, hint = GROUP_HINT[cat]
+        by = {}
+        for z, pid, _ in items:
+            by.setdefault(z, []).append(pid)
+        lines.append(f"{title}：{len(items)} 株")
+        for z, ids in by.items():
+            lines.append(f"    {ZONES[z]['name']}：" + " ".join(ids) + "（" + hint.format(z=z) + "）")
+    page = posint(a[0]) if a else 1
+    per = 30
+    pages = max(1, (len(lines) + per - 1) // per)
+    if page is None or page > pages:
+        g.say(f"tasks 后面写页码 1~{pages}。")
+        return
+    g.say(f"📌 今天的待办（{len(t)} 件）" + (f"，第 {page}/{pages} 页" if pages > 1 else "") + "：")
+    for line in lines[(page - 1) * per: page * per]:
+        g.say("  " + line)
+    if page < pages:
+        g.say(f"  ……还有 {len(lines) - page * per} 行，tasks {page + 1} 看下一页")
+
+
+def c_forecast(g, a):
+    n = posint(a[0]) if a else 3
+    if n is None or n > 14:
+        g.say("forecast 后面写 1~14 天，比如 forecast 7。")
+        return
+    t = [x for x in _tasks(g, n) if 0 < x[0] <= n]
+    if not t:
+        g.say(f"未来 {n} 天，按现有记录看没有到期的事。")
+        return
+    g.say(f"🗓️ 未来 {n} 天（只根据你已知的记录推算）：")
+    for _, line in t:
+        g.say("  " + line)
+
+
+def c_compare(g, a):
+    refs = [x for x in a if not find_trait(x)]
+    traits = [find_trait(x) for x in a if find_trait(x)] or ["flower", "leaf"]
+    if len(refs) < 2:
+        g.say("用法：compare <实验或批次> <实验或批次> [性状]，比如 compare X018 X019 花色")
+        return
+    groups = []
+    for r in refs[:4]:
+        kids, ref = _offspring(g, r)
+        if kids is None:
+            g.say(f"没有 {r} 这个实验或批次。")
+            return
+        groups.append((ref, kids))
+    for t in traits:
+        g.say(f"📊 {TRAIT_CN[t]}：")
+        cats = []
+        counts = []
+        for ref, kids in groups:
+            c = _counter(_cat_key(p, t) for p in kids if t in p["obs"])
+            counts.append(c)
+            for k in c:
+                if k not in cats:
+                    cats.append(k)
+        if not cats:
+            g.say("  （这几组都还没有观察记录）")
+            continue
+        head = "  " + "表现".ljust(12) + "".join(ref.ljust(14) for ref, _ in groups)
+        g.say(head)
+        for k in cats:
+            row = "  " + k[:10].ljust(12)
+            for c in counts:
+                tot = sum(c.values())
+                v = c.get(k, 0)
+                row += (f"{v}（{v / tot:.0%}）" if tot else "-").ljust(14)
+            g.say(row)
+        g.say("  " + "合计".ljust(12) + "".join(str(sum(c.values())).ljust(14) for c in counts))
+
+
+def c_project(g, a):
+    s = g.s
+    pj = s.setdefault("projects", {})
+    sub = a[0].lower() if a else "list"
+    if sub in ("list", "列表") or not a:
+        if not pj:
+            g.say("还没有研究项目。project new <名字> 建一个。")
+            return
+        for n, x in pj.items():
+            g.say(f"  「{n}」第 {x['day']} 天建立｜{len(x['items'])} 个实验/批次" + (f"｜{x['note']}" if x.get("note") else ""))
+        return
+    if sub in ("new", "新建"):
+        name = " ".join(a[1:]).strip()
+        if not name:
+            g.say("project new <名字>")
+            return
+        if name in pj:
+            g.say("已经有这个项目了。")
+            return
+        pj[name] = {"day": s["day"], "items": [], "note": ""}
+        s["cur_project"] = name
+        g.say(f"📁 新建研究项目「{name}」。接下来 project add X005 X006 ……（默认加到最近新建或查看的项目）")
+        return
+    if sub in ("add", "加"):
+        items = [x.upper() for x in a[1:]]
+        name = s.get("cur_project")
+        # project add <名字> X001 …
+        if items and items[0] not in s["crosses"] and items[0] not in s["lots"]:
+            name = a[1]
+            items = [x.upper() for x in a[2:]]
+        if name not in pj:
+            g.say("先 project new <名字>，或者写 project add <项目名> X001 X002")
+            return
+        bad = [x for x in items if x not in s["crosses"] and x not in s["lots"]]
+        if bad:
+            g.say("没有这些实验/批次：" + "、".join(bad))
+            return
+        for x in items:
+            if x not in pj[name]["items"]:
+                pj[name]["items"].append(x)
+        g.say(f"📁 「{name}」：" + "、".join(pj[name]["items"]))
+        return
+    if sub in ("note", "备注"):
+        name = s.get("cur_project")
+        if name not in pj:
+            g.say("先建或查看一个项目。")
+            return
+        pj[name]["note"] = " ".join(a[1:])[:300]
+        g.say(f"📁 「{name}」的备注更新了。")
+        return
+    if sub in ("status", "状态"):
+        name = " ".join(a[1:]).strip() or s.get("cur_project")
+        if name not in pj:
+            g.say("没有这个项目。project list")
+            return
+        s["cur_project"] = name
+        x = pj[name]
+        g.say(f"📁 研究项目「{name}」（第 {x['day']} 天建立）" + (f"——{x['note']}" if x.get("note") else ""))
+        for ref in x["items"]:
+            kids, _ = _offspring(g, ref)
+            if ref in s["crosses"]:
+                c = s["crosses"][ref]
+                f = "自交" if c["kind"] == "self" else "开放授粉" if c["father"] == "open" else c["father"]
+                head = f"  {ref}｜♀{c['mother']}×{f}｜{c['status']}"
+            else:
+                l = s["lots"][ref]
+                head = f"  {ref}｜{l['label']}｜剩 {len(l['seeds'])} 粒"
+            alive = sum(1 for p in kids if p["alive"])
+            obs = {TRAIT_CN[t]: sum(1 for p in kids if t in p["obs"]) for t in ("flower", "leaf", "height")}
+            g.say(head + (f"｜后代 {alive}/{len(kids)} 活｜观察：" + "，".join(f"{k}{v}" for k, v in obs.items() if v) if kids else ""))
+        g.say("（compare 可以把其中几组放在一起比；ratio X001+X002 花色 合并统计）")
+        return
+    g.say("project new <名字>｜project add [项目名] <实验…>｜project status [项目名]｜project note <文字>｜project list")
+
+
 def c_choose(g, a):
     p = g.s["pending"]
     if not p:
@@ -3013,11 +3408,10 @@ def c_choose(g, a):
 
 def c_end(g, a):
     s = g.s
-    try:
-        n = int(a[0]) if a else 1
-    except ValueError:
-        n = 1
-    n = max(1, min(n, 7))
+    n = posint(a[0]) if a else 1
+    if n is None or n > 7:
+        g.say("天数要写 1~7 的整数（end 或 end 3）。时间没有往前走。")
+        return
     for i in range(n):
         if i > 0 and s["pending"]:
             break
@@ -3031,6 +3425,7 @@ def c_end(g, a):
 
 
 COMMANDS = {
+    "tasks": c_tasks, "todo": c_tasks, "forecast": c_forecast, "compare": c_compare, "project": c_project,
     "help": c_help, "status": c_status, "st": c_status, "zones": c_zones, "map": c_zones, "zone": c_zone,
     "plants": c_plants, "ls": c_plants, "plant": c_plant, "tree": c_tree, "lots": c_lots, "lot": c_lot,
     "exp": c_exp, "ratio": c_ratio, "select": c_select, "catalog": c_catalog, "docs": c_docs, "read": c_read,
@@ -3044,7 +3439,7 @@ COMMANDS = {
     "people": c_people, "npc": c_npc, "talk": c_talk, "ask": c_ask, "give": c_give, "write": c_write,
     "open": c_open, "search": c_search, "report": c_report, "choose": c_choose, "end": c_end, "sleep": c_end,
 }
-ZH = {"帮助": "help", "状态": "status", "温室": "zones", "植株": "plants", "档案": "plant", "谱系": "tree",
+ZH = {"待办": "tasks", "预告": "forecast", "对比": "compare", "项目": "project", "帮助": "help", "状态": "status", "温室": "zones", "植株": "plants", "档案": "plant", "谱系": "tree",
       "种子": "lots", "批次": "lot", "实验": "exp", "比例": "ratio", "筛选": "select", "图鉴": "catalog",
       "文件": "docs", "阅读": "read", "日志": "log", "笔记": "note", "标记": "mark", "观察": "observe",
       "检测": "test", "播种": "sow", "浇水": "water", "施肥": "feed", "修剪": "prune", "换盆": "repot",
@@ -3053,7 +3448,7 @@ ZH = {"帮助": "help", "状态": "status", "温室": "zones", "植株": "plants
       "收藏温室": "collection", "日记": "diary", "取名": "name", "标签": "tag", "标本": "press", "物资": "supplies",
       "商店": "shop", "买": "buy", "升级": "upgrade", "人": "people", "聊": "talk", "问": "ask", "送": "give",
       "写信": "write", "打开": "open", "搜": "search", "报告": "report", "选": "choose", "结束": "end", "睡觉": "end"}
-FREE = {"help", "status", "st", "zones", "map", "zone", "plants", "ls", "plant", "tree", "lots", "lot", "exp",
+FREE = {"tasks", "todo", "forecast", "compare", "project", "help", "status", "st", "zones", "map", "zone", "plants", "ls", "plant", "tree", "lots", "lot", "exp",
         "ratio", "select", "catalog", "docs", "log", "note", "notes", "mark", "flasks", "collection", "diary", "name",
         "tag", "supplies", "shop", "people", "npc", "choose", "relabel", "clear"}
 
@@ -3127,6 +3522,13 @@ def _migrate(st):
         st.setdefault(k, val)
     for k, val in base["supplies"].items():
         st["supplies"].setdefault(k, 0)
+    yr0 = (st.get("day", 1) - 1) // YEAR_LEN * YEAR_LEN
+    if "eval_done" in st.get("flags", []) and not any(e[0] > yr0 for e in st.get("evals", [])):
+        st["flags"].remove("eval_done")  # 旧存档：去年的评估标记没清
+    for x in st.get("crosses", {}).values():
+        m = st["plants"].get(x.get("mother"))
+        if m and not m["alive"] and not x.get("lot") and not x["status"].startswith("失败"):
+            x["status"] = "失败：母本死了，果实没能成熟"
     st["v"] = VERSION
     return st
 
@@ -3176,10 +3578,36 @@ def _game():
     return _G
 
 
+TEXT_CMDS = {"note", "笔记", "diary", "日记", "mark", "标记", "label"}
+
+
+def split_batch(text):
+    """按 ; 和换行拆指令。note / diary / mark 这类写字的指令会把后面的内容（含分号、换行）整个收下。"""
+    raw = str(text)
+    out = []
+    i = 0
+    parts = re.split(r"(;|；|\n)", raw)
+    while i < len(parts):
+        seg = parts[i]
+        i += 1
+        if seg in (";", "；", "\n"):
+            continue
+        st = seg.strip()
+        if not st:
+            continue
+        first = st.split()[0].lower()
+        if first in TEXT_CMDS:
+            st = (st + "".join(parts[i:])).strip()
+            out.append(st)
+            break
+        out.append(st)
+    return out
+
+
 def cmd(text="status"):
-    """执行指令，返回文字。多条用 ; 或换行分隔（一次最多 10 条）。"""
+    """执行指令，返回文字。多条用 ; 或换行分隔（一次最多 10 条）。note/diary/mark 后面的分号会当成文字。"""
     g = _game()
-    lines = [x.strip() for x in str(text).replace("；", ";").replace("\n", ";").split(";") if x.strip()]
+    lines = split_batch(text)
     if not lines:
         lines = ["status"]
     over = len(lines) > MAX_BATCH
@@ -3202,8 +3630,12 @@ def cmd(text="status"):
             g.out.append("")
         rest = len(lines) - k - 1
         if rest and (g.s["pending"] or g.s["day"] != day):
-            why = "有事等你决定" if g.s["pending"] else "新的一天开始了"
-            g.out.append(f"⏸️ 批量指令在这里停下（{why}），后面 {rest} 条没有执行。")
+            skipped = "；".join(lines[k + 1:])
+            if g.s["pending"]:
+                g.out.append(f"⏸️ 有事等你决定，后面 {rest} 条先没执行：{skipped}")
+            else:
+                g.out.append(f"⏸️ 已经是第 {g.s['day']} 天了。为了让你先看清早上的情况，后面 {rest} 条没有执行：{skipped}"
+                             "（想继续就把它们重新发一次）")
             break
     if over:
         g.out.append(f"（一次最多 {MAX_BATCH} 条，后面的没有执行）")
